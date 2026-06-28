@@ -27,6 +27,9 @@
 
 #include "event_m4.hpp"
 
+#include <cmath>
+#include <complex>
+
 #define SYN 0x16
 #define SOH 0x01
 #define STX 0x02
@@ -38,10 +41,30 @@ ACARSProcessor::ACARSProcessor() {
     audio::dma::init_audio_out();
     decim_0.configure(taps_11k0_decim_0.taps);
     decim_1.configure(taps_11k0_decim_1.taps);
-    decode_data = 0;
-    decode_count_bit = 0;
+    init_msk();
     audio_output.configure(false);
     baseband_thread.start();
+}
+
+// Build the MSK matched filter and reset the demodulator state.
+// msk_h is a half-cosine pulse at 600 Hz (the MSK half-symbol), clamped to
+// non-negative and oversampled by msk_fltover so it can be sampled at the
+// fractional bit-timing offset chosen by the PLL each bit.
+void ACARSProcessor::init_msk() {
+    for (int i = 0; i < msk_fleno; i++) {
+        float v = cosf(2.0f * msk_pi * 600.0f / msk_intrate / msk_fltover *
+                       (i - (msk_fleno - 1) / 2));
+        msk_h[i] = (v < 0.0f) ? 0.0f : v;
+    }
+    msk_idx = 0;
+    msk_osc = {1.0f, 0.0f};
+    msk_clk = 0.0f;
+    msk_df = 0.0f;
+    msk_state = 0;
+    msk_s = 2.0f * msk_pi * 1800.0f / msk_intrate;  // VCO at the 1800 Hz MSK centre
+    msk_rot = {cosf(-msk_s), sinf(-msk_s)};
+    for (auto& s : msk_inb)
+        s = {0.0f, 0.0f};
 }
 
 void ACARSProcessor::execute(const buffer_c8_t& buffer) {
@@ -54,24 +77,81 @@ void ACARSProcessor::execute(const buffer_c8_t& buffer) {
     /* 38.4kHz, 32 samples */
     feed_channel_stats(decimator_out);
 
-    auto audio = demod.execute(decimator_out, audio_buffer);
-    audio_output.write(audio);
+    // AM detect -> real envelope carrying the 1200/2400 Hz MSK audio.
+    const auto am_audio = demod.execute(decimator_out, audio_buffer);
+    audio_output.write(am_audio);  // also routed to the speaker for tuning
 
-    for (size_t i = 0; i < decimator_out.count; i++) {
-        if (mf.execute_once(decimator_out.p[i])) {
-            clock_recovery(mf.get_output());
+    // Recover bits from the envelope and feed the framing state machine.
+    demod_msk(am_audio);
+}
+
+// Coherent MSK demodulator (ported from acarsdec demodMSK, T. Leconte).
+// Per sample: mix the AM envelope down by the 1800 Hz VCO into a ring buffer.
+// Once per bit (every 3*pi/2 of VCO phase = one ACARS bit at 2400 bps): run the
+// oversampled matched filter at the PLL-chosen timing offset, take the MSK
+// decision (alternating I/Q rails), update the carrier/bit PLL, and hand the
+// soft bit to consume_symbol().
+void ACARSProcessor::demod_msk(const buffer_f32_t& audio_in) {
+    for (size_t n = 0; n < audio_in.count; n++) {
+        // VCO / mixer: advance oscillator, downconvert this sample.
+        msk_osc *= msk_rot;
+        const float in = audio_in.p[n];
+        msk_inb[msk_idx] = in * msk_osc;
+        msk_idx = (msk_idx + 1) % msk_flen;
+
+        // Bit clock: a decision is due every 3*pi/2 of accumulated VCO phase.
+        msk_clk += msk_s;
+        if (msk_clk < (3.0f * msk_pi / 2.0f - msk_s / 2.0f))
+            continue;
+        msk_clk -= 3.0f * msk_pi / 2.0f;
+
+        // Matched filter at the fractional timing offset for this bit.
+        int o = static_cast<int>(msk_fltover * (msk_clk / msk_s + 0.5f));
+        if (o > msk_fltover)
+            o = msk_fltover;
+        std::complex<float> v{0.0f, 0.0f};
+        for (int j = 0; j < msk_flen; j++, o += msk_fltover)
+            v += msk_h[o] * msk_inb[(j + msk_idx) % msk_flen];
+
+        // Normalise to unit magnitude so the PLL error is amplitude-independent.
+        const float lvl = std::abs(v);
+        v /= (lvl + 1e-8f);
+
+        // MSK decision: even bits ride the real rail, odd bits the imaginary
+        // rail; dphi is the carrier-phase error fed to the PLL.
+        float vo;
+        float dphi;
+        if (msk_state & 1) {
+            vo = v.imag();
+            dphi = (vo >= 0.0f) ? -v.real() : v.real();
+        } else {
+            vo = v.real();
+            dphi = (vo >= 0.0f) ? v.imag() : -v.imag();
         }
+
+        // Alternate the data-bit sign every other pair of decisions.
+        float bit_soft = (msk_state & 2) ? -vo : vo;
+        if (msk_invert)
+            bit_soft = -bit_soft;
+        consume_symbol(bit_soft);  // slices >= 0 -> bit 1, then runs framing
+        msk_state++;
+
+        // PLL loop filter, then refresh the VCO step and per-sample rotation.
+        msk_df = msk_pllc * msk_df + (1.0f - msk_pllc) * msk_pllg * dphi;
+        msk_s = 2.0f * msk_pi * 1800.0f / msk_intrate + msk_df;
+        msk_rot = {cosf(-msk_s), sinf(-msk_s)};
+
+        // Keep the mixing oscillator on the unit circle.
+        msk_osc /= (std::abs(msk_osc) + 1e-8f);
     }
 }
 
+// Shift one demodulated bit into the byte assembler, LSB first (ACARS wire
+// order). After 8 bits the byte sits in bits [7:0] and matches the real ACARS
+// byte values used by the framing comparisons below.
 void ACARSProcessor::add_bit(uint8_t bit) {
-    decode_data = decode_data << 1 | bit;
+    decode_data = (decode_data >> 1) | (static_cast<uint32_t>(bit & 1) << 7);
     decode_count_bit++;
-}
-
-uint16_t ACARSProcessor::update_crc(uint8_t dataByte) {
-    (void)dataByte;
-    return 0;
 }
 
 void ACARSProcessor::sendDebug() {
@@ -101,7 +181,7 @@ void ACARSProcessor::consume_symbol(const float raw_symbol) {
             decode_data = 0;
             decode_count_bit = 0;
         } else {
-            decode_count_bit -= 1;  // just drop the first bit
+            decode_count_bit -= 1;  // slide the search window by one bit
         }
         return;
     }

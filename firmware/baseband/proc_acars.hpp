@@ -31,12 +31,6 @@
 
 #include "spectrum_collector.hpp"
 
-#include <cstdint>
-
-#include "baseband_processor.hpp"
-#include "baseband_thread.hpp"
-#include "rssi_thread.hpp"
-
 #include "channel_decimator.hpp"
 #include "matched_filter.hpp"
 
@@ -49,69 +43,22 @@
 #include "dsp_demodulate.hpp"
 #include "audio_output.hpp"
 
-#include <cstdint>
-#include <cstddef>
-#include <bitset>
-
 #include "crc.hpp"
 
-// AIS:
-// IN: 2457600/8/8 = 38400
-// Offset: 2457600/4 = 614400 (614400/8/8 = 9600)
-// Deviation: 2400
-// Symbol: 9600
-// Decimate: 2
-// 4 taps, 1 symbol, 1/4 cycle
+#include <array>
+#include <complex>
+#include <cstdint>
+#include <cstddef>
 
-// TPMS:
-// IN: 2457600/4/2 = 307200
-// Offset: 2457600/4 = 614400 (614400/4/2 = 76800)
-// Deviation: 38400
-// Symbol: 19200
-// Decimate: 8
-// 16 taps, 1 symbol, 2 cycles
-
-// ACARS:
-// IN: 2457600/8/8 = 38400
-// Offset: 2457600/4 = 614400 (614400/8/8 = 9600)
-// Deviation: ???
-// Symbol: 2400
-// Decimate: 8
-// 16 taps, 1 symbol, 2 cycles
-
-// Number of taps: size of one symbol in samples (in/symbol)
-// Cycles:
-
-// Translate+rectangular filter
-// sample=38.4k, deviation=4800, symbol=2400
-// Length: 16 taps, 1 symbol, 2 cycles of sinusoid
-// This is actually the same as rect_taps_307k2_38k4_1t_19k2_p
-constexpr std::array<std::complex<float>, 16> rect_taps_38k4_4k8_1t_2k4_p{{
-    {6.2500000000e-02f, 0.0000000000e+00f},
-    {4.4194173824e-02f, 4.4194173824e-02f},
-    {0.0000000000e+00f, 6.2500000000e-02f},
-    {-4.4194173824e-02f, 4.4194173824e-02f},
-    {-6.2500000000e-02f, 0.0000000000e+00f},
-    {-4.4194173824e-02f, -4.4194173824e-02f},
-    {0.0000000000e+00f, -6.2500000000e-02f},
-    {4.4194173824e-02f, -4.4194173824e-02f},
-    {6.2500000000e-02f, 0.0000000000e+00f},
-    {4.4194173824e-02f, 4.4194173824e-02f},
-    {0.0000000000e+00f, 6.2500000000e-02f},
-    {-4.4194173824e-02f, 4.4194173824e-02f},
-    {-6.2500000000e-02f, 0.0000000000e+00f},
-    {-4.4194173824e-02f, -4.4194173824e-02f},
-    {0.0000000000e+00f, -6.2500000000e-02f},
-    {4.4194173824e-02f, -4.4194173824e-02f},
-}};
-
-typedef enum { WSYN,
-               SYN2,
-               SOH1,
-               TXT,
-               CRC1,
-               CRC2,
-               END } Acarsstate;
+// ACARS bit-framing states: wait for SYN/SYN/SOH preamble, accumulate text,
+// then read the two CRC bytes.
+enum Acarsstate { WSYN,
+                  SYN2,
+                  SOH1,
+                  TXT,
+                  CRC1,
+                  CRC2,
+                  END };
 
 class ACARSProcessor : public BasebandProcessor {
    public:
@@ -122,6 +69,7 @@ class ACARSProcessor : public BasebandProcessor {
    private:
     static constexpr size_t baseband_fs = 2457600;
 
+    // ---- Front end: translate + decimate to 38.4 kHz, then AM detect ----
     std::array<complex16_t, 512> dst{};
     const buffer_c16_t dst_buffer{
         dst.data(),
@@ -129,20 +77,6 @@ class ACARSProcessor : public BasebandProcessor {
 
     dsp::decimate::FIRC8xR16x24FS4Decim8 decim_0{};  // Translate already done here !
     dsp::decimate::FIRC16xR16x32Decim8 decim_1{};
-    dsp::matched_filter::MatchedFilter mf{rect_taps_38k4_4k8_1t_2k4_p, 8};
-
-    clock_recovery::ClockRecovery<clock_recovery::FixedErrorFilter> clock_recovery{
-        4800,
-        2400,
-        {0.0555f},
-        [this](const float symbol) { this->consume_symbol(symbol); }};
-
-    uint16_t update_crc(uint8_t dataByte);
-    void consume_symbol(const float symbol);
-    void payload_handler();
-    void add_bit(uint8_t bit);
-    void reset();
-    void sendDebug();
 
     std::array<float, 32> audio{};
     const buffer_f32_t audio_buffer{
@@ -151,12 +85,50 @@ class ACARSProcessor : public BasebandProcessor {
     dsp::demodulate::AM demod{};
     AudioOutput audio_output{};
 
-    Acarsstate curr_state = WSYN;
+    // ---- MSK demodulator ----
+    // ACARS is 2400 bps MSK (1200/2400 Hz tones, 1800 Hz center) carried as AM.
+    // The AM envelope produced by 'demod' is fed to a coherent MSK demodulator
+    // with a combined carrier / bit-clock PLL. The algorithm is ported from
+    // acarsdec demodMSK() (Copyright (c) 2017 Thierry Leconte, LGPL v2,
+    // https://github.com/TLeconte/acarsdec), adapted to single-precision float
+    // and to this 38.4 kHz front end. Constants that may need on-air tuning are
+    // grouped below.
+    static constexpr int msk_intrate = 38400;                     // = audio sample rate
+    static constexpr int msk_flen = msk_intrate / 1200 + 1;       // matched-filter span (samples)
+    static constexpr int msk_fltover = 12;                        // matched-filter oversampling
+    static constexpr int msk_fleno = msk_flen * msk_fltover + 1;  // oversampled filter length
+    static constexpr float msk_pi = 3.14159265358979f;
+    static constexpr float msk_pllc = 0.52f;   // PLL loop pole (tunable)
+    static constexpr float msk_pllg = 38e-4f;  // PLL loop gain (tunable)
+    // Set to true if the recovered bit stream is inverted for your receiver
+    // (signal clearly present but no SYN lock at all): flip and rebuild.
+    static constexpr bool msk_invert = false;
 
+    std::array<float, msk_fleno> msk_h{};                 // matched filter (clamped half-cosine)
+    std::array<std::complex<float>, msk_flen> msk_inb{};  // mixer ring buffer
+    int msk_idx = 0;
+    std::complex<float> msk_osc{1.0f, 0.0f};  // mixing oscillator (kept at |.| = 1)
+    std::complex<float> msk_rot{1.0f, 0.0f};  // per-sample rotation = e^(-j*msk_s)
+    float msk_s = 0.0f;                       // VCO step (rad/sample)
+    float msk_clk = 0.0f;                     // bit-clock phase accumulator
+    float msk_df = 0.0f;                      // PLL frequency correction
+    int msk_state = 0;                        // MSK I/Q decision phase (0..3)
+
+    void init_msk();
+    void demod_msk(const buffer_f32_t& audio_in);
+
+    // ---- Bit framing / packet assembly ----
+    Acarsstate curr_state = WSYN;
     uint32_t decode_data = 0;
     uint8_t decode_count_bit = 0;
     ACARSPacketMessage message{};
     uint8_t parity_errors = 0;
+
+    void consume_symbol(const float symbol);
+    void add_bit(uint8_t bit);
+    void payload_handler();
+    void reset();
+    void sendDebug();
 
     /* NB: Threads should be the last members in the class definition. */
     BasebandThread baseband_thread{

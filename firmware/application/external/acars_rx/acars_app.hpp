@@ -31,24 +31,45 @@
 #include "ui_rssi.hpp"
 #include "log_file.hpp"
 
+#include <cstdint>
+#include <cstddef>
+
 namespace ui::external_app::acars_rx {
 
-// Decoded ACARS message fields extracted from a raw frame.
-// CRC-16/CCITT (poly 0x1021, init 0x0000) is verified against the two
-// trailing bytes of the raw frame; crc_ok reflects that result.
+// Decoded ACARS frame fields.
+//
+// Field layout, 7-bit deparity and CRC handling are reimplemented from the
+// algorithm in libacars la_acars_parse() (Copyright (c) 2018-2023
+// Tomasz Lemiech, https://github.com/szpajder/libacars). This is a clean
+// reimplementation against fixed buffers, not a copy of that source.
+//
+// crc_ok reflects the ACARS CRC: reflected CRC-16/CCITT (Kermit, poly 0x8408,
+// init 0x0000). Running it over the frame bytes (parity still set) followed by
+// the two received CRC bytes yields 0 on a valid frame.
 struct AcarsDecoded {
-    bool crc_ok{false};
+    bool crc_ok{false};       // CRC residue check passed
+    bool valid{false};        // structural parse succeeded
+    bool more{false};         // ETB -> more blocks follow; ETX -> final block
+    bool downlink{false};     // block_id in '0'..'9' => air-to-ground
+    char mode{' '};
+    char ack{' '};
+    char block_id{' '};
+    char msg_num_seq{' '};    // downlink only
     std::string reg{};
     std::string label{};
-    std::string flight_id{};
-    std::string msg_num{};
-    char block_id{'\0'};
+    std::string msg_num{};    // downlink only
+    std::string flight_id{};  // downlink only
     std::string txt{};
 };
 
-// Decode a raw ACARS frame: verify CRC-16/CCITT and extract fixed-offset fields.
-// Returns a partially-filled AcarsDecoded (txt error only) if the frame is too short.
-AcarsDecoded acars_decode(const std::string& raw);
+// Decode a raw ACARS frame as delivered by the baseband processor:
+//   raw      = bytes from MODE .. ETX/ETB inclusive, parity bits still set
+//   raw_len  = length of raw
+//   crc_lo   = first  trailing CRC byte (LSB), captured by the proc
+//   crc_hi   = second trailing CRC byte (MSB), captured by the proc
+// On a structural error, returns with valid == false and txt set to the reason
+// (crc_ok is still meaningful).
+AcarsDecoded acars_decode(const uint8_t* raw, size_t raw_len, uint8_t crc_lo, uint8_t crc_hi);
 
 // Format a decoded ACARS message for display or logging.
 std::string acars_format(const AcarsDecoded& msg);
